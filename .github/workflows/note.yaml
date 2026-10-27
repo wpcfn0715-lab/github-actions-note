@@ -64,17 +64,17 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
-      - name: Install Claude Code SDK
+      - name: Install Claude Agent SDK
         run: |
           npm init -y
-          npm i @anthropic-ai/claude-code
+          npm i @anthropic-ai/claude-agent-sdk@0.3
 
-      - name: Research with Claude Code SDK
+      - name: Research with Claude Agent SDK
         run: |
           cat > research.mjs <<'EOF'
-          import { query } from '@anthropic-ai/claude-code';
+          import { query } from '@anthropic-ai/claude-agent-sdk';
           import fs from 'fs';
           const theme = process.env.THEME || '';
           const target = process.env.TARGET || '';
@@ -92,7 +92,7 @@ jobs:
           for await (const msg of query({
             prompt: userPrompt,
             options: {
-              customSystemPrompt: sys,
+              systemPrompt: sys,
               allowedTools: ['WebSearch','WebFetch'],
               permissionMode: 'acceptEdits',
             },
@@ -122,7 +122,7 @@ jobs:
             .note-artifacts/research_trace.json
 
   write:
-    name: Write (Claude Sonnet 4.0)
+    name: Write (Claude Sonnet)
     needs: research
     runs-on: ubuntu-latest
     env:
@@ -142,12 +142,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install AI SDK
         run: |
           npm init -y
-          npm i ai @ai-sdk/anthropic
+          npm i ai@5 @ai-sdk/anthropic@2
 
       - name: Restore research
         env:
@@ -165,9 +165,9 @@ jobs:
           const theme=process.env.THEME||''; const target=process.env.TARGET||''; const message=process.env.MESSAGE||''; const cta=process.env.CTA||'';
           const inputTags=(process.env.INPUT_TAGS||'').split(',').map(s=>s.trim()).filter(Boolean);
           const researchReport=fs.readFileSync('.note-artifacts/research.md','utf8');
-          const modelName='claude-sonnet-4-5-20250929';
+          const modelName=process.env.CLAUDE_MODEL||'claude-sonnet-5-5';
           function extractJsonFlexible(raw){const t=(raw||'').trim().replace(/\u200B/g,'');try{return JSON.parse(t);}catch{}const m=t.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/);if(m&&m[1]){try{return JSON.parse(m[1].trim());}catch{}}const f=t.indexOf('{'),l=t.lastIndexOf('}');if(f!==-1&&l!==-1&&l>f){const c=t.slice(f,l+1);try{return JSON.parse(c);}catch{}}return null;}
-          async function repairJson(raw){const sys='入力から {"title":string,"draftBody":string,"tags":string[]} のJSONのみ返答。';const {text}=await generateText({model:anthropic(modelName),system:sys,prompt:String(raw),temperature:0,maxTokens:8000});return extractJsonFlexible(text||'');}
+          async function repairJson(raw){const sys='入力から {"title":string,"draftBody":string,"tags":string[]} のJSONのみ返答。';const {text}=await generateText({model:anthropic(modelName),system:sys,prompt:String(raw),temperature:0,maxOutputTokens:8000});return extractJsonFlexible(text||'');}
           function sanitizeTitle(t){
             let s=String(t||'').trim();
             // フェンスや見出し、引用符を除去
@@ -186,7 +186,7 @@ jobs:
           }
           const sysWrite='note.com向け長文記事の生成。JSON {title,draftBody,tags[]} で返答。draftBodyは6000〜9000文字を目安に十分な分量で、章ごとに小見出しと箇条書きを適切に含めること。';
           const prompt=[`{テーマ}: ${theme}`,`{ペルソナ}: ${target}`,`{リサーチ内容}: ${researchReport}`,`{伝えたいこと}: ${message}`,`{読後のアクション}: ${cta}`].join('\n');
-          const {text}=await generateText({model:anthropic(modelName),system:sysWrite,prompt,temperature:0.7,maxTokens:30000});
+          const {text}=await generateText({model:anthropic(modelName),system:sysWrite,prompt,temperature:0.7,maxOutputTokens:30000});
           let obj=extractJsonFlexible(text||'')||await repairJson(text||'');
           let title, draftBody, tags; if(obj){title=sanitizeTitle(obj.title); draftBody=String(obj.draftBody||'').trim(); tags=Array.isArray(obj.tags)?obj.tags.map(String):[]}
           if(!title||!draftBody){ title=deriveTitleFromText(text||''); const lines=(text||'').split(/\r?\n/); draftBody=lines.slice(1).join('\n').trim()||(text||''); tags=[]}
@@ -231,12 +231,12 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install AI SDK
         run: |
           npm init -y
-          npm i ai @ai-sdk/anthropic
+          npm i ai@5 @ai-sdk/anthropic@2
 
       - name: Restore draft json
         env:
@@ -252,7 +252,7 @@ jobs:
           import { anthropic } from '@ai-sdk/anthropic';
           import fs from 'fs';
           const draft=JSON.parse(fs.readFileSync('.note-artifacts/draft.json','utf8'));
-          const modelName='claude-sonnet-4-5-20250929';
+          const modelName=process.env.CLAUDE_MODEL||'claude-sonnet-5-5';
           const TAVILY_API_KEY=process.env.TAVILY_API_KEY||'';
           if(!TAVILY_API_KEY){ console.error('TAVILY_API_KEY is not set'); process.exit(1); }
 
@@ -275,7 +275,7 @@ jobs:
 
           async function proposeQueries(body){
             const sys='あなたは事実検証の専門家です。入力本文から検証が必要な固有名詞・数値・主張を抽出し、Tavily検索用に日本語の検索クエリを最大10件の配列で返してください。出力はJSON配列のみ。';
-            const { text } = await generateText({ model: anthropic(modelName), system: sys, prompt: String(body), temperature: 0, maxTokens: 2000 });
+            const { text } = await generateText({ model: anthropic(modelName), system: sys, prompt: String(body), temperature: 0, maxOutputTokens: 2000 });
             const arr = extractJsonFlexible(text||'');
             return Array.isArray(arr) ? arr.map(String).filter(Boolean).slice(0,10) : [];
           }
@@ -319,7 +319,7 @@ jobs:
             const prompt = [
               '## 原稿', String(draft.draftBody||''), '', '## エビデンス（Tavily検索結果）', evidence
             ].join('\n\n');
-            const { text } = await generateText({ model: anthropic(modelName), system: sys, prompt, temperature: 0.3, maxTokens: 30000 });
+            const { text } = await generateText({ model: anthropic(modelName), system: sys, prompt, temperature: 0.3, maxOutputTokens: 30000 });
             let body = stripCodeFence(text||'');
             let title = process.env.TITLE || draft.title || '';
             let tags = Array.isArray(draft.tags)? draft.tags: [];
@@ -376,7 +376,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Install Playwright
         run: |
