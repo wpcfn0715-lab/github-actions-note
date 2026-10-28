@@ -230,13 +230,19 @@ jobs:
         const blocks = splitMarkdownBlocks(preBody);
 
         let browser, context, page;
+        const diag = [];
         try{
-          browser = await chromium.launch({ headless: true, args: ['--lang=ja-JP'] });
-          context = await browser.newContext({ storageState: STATE_PATH, locale: 'ja-JP' });
+          browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--lang=ja-JP','--disable-blink-features=AutomationControlled'] });
+          context = await browser.newContext({ storageState: STATE_PATH, locale: 'ja-JP', timezoneId: 'Asia/Tokyo', viewport: { width: 1280, height: 900 }, userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36' });
+          await context.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); });
           page = await context.newPage();
-          page.setDefaultTimeout(180000);
+          page.setDefaultTimeout(90000);
+          page.on('pageerror', e => diag.push('JSエラー: ' + e.message));
+          page.on('console', m => { if (m.type() === 'error') diag.push('コンソール: ' + m.text()); });
+          page.on('requestfailed', r => diag.push('通信失敗: ' + r.url().slice(0, 120) + ' ' + (r.failure()?.errorText || '')));
+          page.on('response', r => { if (r.status() >= 400) diag.push('HTTP ' + r.status() + ': ' + r.url().slice(0, 120)); });
 
-          await page.goto(START_URL, { waitUntil: 'domcontentloaded' });
+          await page.goto(START_URL, { waitUntil: 'networkidle' }).catch(() => {});
           await page.waitForSelector('textarea[placeholder*="タイトル"]');
           await page.fill('textarea[placeholder*="タイトル"]', TITLE);
 
@@ -324,8 +330,10 @@ jobs:
               buttons: [...document.querySelectorAll('button')].map(b => (b.innerText || b.getAttribute('aria-label') || '').trim()).filter(Boolean).slice(0, 30),
               text: document.body?.innerText?.slice(0, 300) || '',
             }));
-            ann('入力欄: ' + JSON.stringify(info.textareas) + ' / 編集エリア数: ' + info.editables);
-            ann('ボタン: ' + JSON.stringify(info.buttons));
+            ann('入力欄: ' + (info.textareas.join(' | ') || 'なし') + ' / 編集エリア数: ' + info.editables);
+            ann('ボタン: ' + (info.buttons.join(' | ') || 'なし'));
+            ann('HTMLの長さ: ' + (await page.content()).length);
+            for (const d of diag.slice(0, 15)) ann(d);
             ann('画面テキスト: ' + info.text);
             await page.screenshot({ path: SS_PATH, fullPage: true });
             console.log('SCREENSHOT=' + SS_PATH);
