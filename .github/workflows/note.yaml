@@ -664,22 +664,47 @@ jobs:
             const finalUrl=page.url();
             console.log('PUBLISHED_URL=' + finalUrl);
             console.log('SCREENSHOT=' + SS_PATH);
+          } catch (err) {
+            // 失敗時の診断情報を「注釈」として出力（Actions画面のサマリーに表示される）
+            const ann = (m) => console.log('::error title=note投稿失敗::' + String(m).replace(/\r?\n/g, ' ').slice(0, 900));
+            ann('エラー: ' + (err?.message || err));
+            try {
+              const url = page?.url() || '';
+              ann('URL: ' + url + ' / タイトル: ' + (await page.title()));
+              if (/\/login/.test(url)) ann('ログイン画面に飛ばされました → note-state.json の作り直しが必要です');
+              const info = await page.evaluate(() => ({
+                textareas: [...document.querySelectorAll('textarea,input[type=text]')].map(e => e.placeholder || e.name || e.tagName).slice(0, 10),
+                editables: document.querySelectorAll('[contenteditable="true"]').length,
+                buttons: [...document.querySelectorAll('button')].map(b => (b.innerText || b.getAttribute('aria-label') || '').trim()).filter(Boolean).slice(0, 30),
+                text: document.body?.innerText?.slice(0, 300) || '',
+              }));
+              ann('入力欄: ' + JSON.stringify(info.textareas) + ' / 編集エリア数: ' + info.editables);
+              ann('ボタン: ' + JSON.stringify(info.buttons));
+              ann('画面テキスト: ' + info.text);
+              await page.screenshot({ path: SS_PATH, fullPage: true });
+              console.log('SCREENSHOT=' + SS_PATH);
+            } catch (e2) { ann('診断にも失敗: ' + e2?.message); }
+            process.exitCode = 1;
           } finally {
             try{ await page?.close(); }catch{}
             try{ await context?.close(); }catch{}
             try{ await browser?.close(); }catch{}
           }
           EOF
-          node post.mjs | tee post.log
-          url=$(grep '^PUBLISHED_URL=' post.log | tail -n1 | cut -d'=' -f2-)
-          draft=$(grep '^DRAFT_URL=' post.log | tail -n1 | cut -d'=' -f2-)
-          shot=$(grep '^SCREENSHOT=' post.log | tail -n1 | cut -d'=' -f2-)
+          set -o pipefail
+          rc=0
+          node post.mjs | tee post.log || rc=$?
+          url=$(grep '^PUBLISHED_URL=' post.log | tail -n1 | cut -d'=' -f2- || true)
+          draft=$(grep '^DRAFT_URL=' post.log | tail -n1 | cut -d'=' -f2- || true)
+          shot=$(grep '^SCREENSHOT=' post.log | tail -n1 | cut -d'=' -f2- || true)
           if [ -n "$url" ]; then echo "published_url=$url" >> $GITHUB_OUTPUT; fi
           if [ -n "$draft" ]; then echo "draft_url=$draft" >> $GITHUB_OUTPUT; fi
           if [ -n "$shot" ]; then echo "screenshot=$shot" >> $GITHUB_OUTPUT; fi
+          if [ -z "$url" ] && [ -z "$draft" ]; then echo "::error title=note投稿失敗::noteへの保存を確認できませんでした"; rc=1; fi
+          exit $rc
 
       - name: Upload screenshot (if any)
-        if: ${{ steps.publish.outputs.screenshot != '' }}
+        if: ${{ always() && steps.publish.outputs.screenshot != '' }}
         uses: actions/upload-artifact@v4
         with:
           name: note-screenshot
