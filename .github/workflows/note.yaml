@@ -7,9 +7,18 @@ on:
         description: '記事テーマ'
         required: true
         type: string
+      ai_engine:
+        description: '使うAI（gemini=無料 / claude=有料・高品質）'
+        required: true
+        default: 'gemini'
+        type: choice
+        options:
+          - 'gemini'
+          - 'claude'
       target:
         description: '想定読者（ペルソナ）'
         required: true
+        default: 'これからAIを使ってみたい初心者（専門知識なし）'
         type: string
       message:
         description: '読者に伝えたい核メッセージ'
@@ -46,13 +55,17 @@ permissions:
 
 env:
   TZ: Asia/Tokyo
+  AI_ENGINE: ${{ github.event.inputs.ai_engine || 'gemini' }}
+  GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-flash-latest' }}
 
 jobs:
   research:
-    name: Research (CCSDK WebSearch/WebFetch)
+    name: Research
     runs-on: ubuntu-latest
     env:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
       THEME: ${{ github.event.inputs.theme }}
       TARGET: ${{ github.event.inputs.target }}
     outputs:
@@ -69,9 +82,41 @@ jobs:
       - name: Install Claude Agent SDK
         run: |
           npm init -y
-          npm i @anthropic-ai/claude-agent-sdk@0.3
+          if [ "$AI_ENGINE" = "claude" ]; then npm i @anthropic-ai/claude-agent-sdk@0.3; else npm i ai@5 @ai-sdk/google@2; fi
+
+      - name: Research with Gemini + Tavily (free)
+        if: ${{ env.AI_ENGINE != 'claude' }}
+        run: |
+          cat > research-gemini.mjs <<'EOF'
+          import { generateText } from 'ai';
+          import { google } from '@ai-sdk/google';
+          import fs from 'fs';
+          const MODEL = google(process.env.GEMINI_MODEL || 'gemini-flash-latest');
+          const theme = process.env.THEME || ''; const target = process.env.TARGET || '';
+          const today = new Date().toISOString().slice(0,10);
+          fs.mkdirSync('.note-artifacts', { recursive: true });
+          const { text: qtext } = await generateText({ model: MODEL, temperature: 0,
+            system: 'テーマについて調べるための日本語の検索クエリを5件、JSON配列のみで返してください。',
+            prompt: `テーマ: ${theme}\n読者: ${target}\n今日: ${today}` });
+          let queries = []; try { queries = JSON.parse((qtext.match(/\[[\s\S]*\]/) || ['[]'])[0]); } catch {}
+          if (!queries.length) queries = [theme];
+          const found = [];
+          for (const q of queries.slice(0, 5)) {
+            const r = await fetch('https://api.tavily.com/search', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ api_key: process.env.TAVILY_API_KEY, query: String(q), search_depth: 'basic', max_results: 5, include_answer: true }) });
+            const j = r.ok ? await r.json().catch(() => ({})) : {};
+            found.push(`### ${q}\n${j.answer || ''}\n` + (j.results || []).map(x => `- [${x.title}](${x.url})\n  ${String(x.content || '').slice(0, 400)}`).join('\n'));
+          }
+          const { text } = await generateText({ model: MODEL, temperature: 0.3,
+            system: 'あなたはリサーチャーです。検索結果だけを根拠に、記事の材料になるリサーチレポートを日本語で作成してください。出典は本文中にMarkdownリンクで示し、検索結果にないことは書かないでください。目安1,500〜2,500字。',
+            prompt: `テーマ: ${theme}\n読者: ${target}\n今日: ${today}\n\n## 検索結果\n${found.join('\n\n')}` });
+          fs.writeFileSync('.note-artifacts/research.md', text || '');
+          fs.writeFileSync('.note-artifacts/research_trace.json', JSON.stringify({ queries }, null, 2));
+          EOF
+          node research-gemini.mjs
 
       - name: Research with Claude Agent SDK
+        if: ${{ env.AI_ENGINE == 'claude' }}
         run: |
           cat > research.mjs <<'EOF'
           import { query } from '@anthropic-ai/claude-agent-sdk';
@@ -84,7 +129,7 @@ jobs:
           const sys = [
             'あなたは最新情報の収集と要約に特化した超一流のリサーチャーです。',
             '事実ベース・一次情報優先・本文内にMarkdownリンクで出典を埋め込むこと。',
-            '十分な分量（目安: 2,000語以上）。各節で出典を本文に埋め込む。',
+            '目安は2,000〜3,000字。記事の材料として要点を押さえ、各節で出典を本文に埋め込む。',
             'WebSearch と WebFetch を必ず使用し、一次情報（公的機関・規格・論文・公式）を優先する。',
           ].join('\n');
           const userPrompt = `以下のテーマとターゲットに対する最終版のリサーチレポートを作成してください。\n【重要】途中経過や確認質問は一切せず、最終レポートのみを返してください。不明点がある場合は「前提と仮定」セクションで簡潔に仮定を明記してから続行してください。事実ベースで一次情報を最優先し、本文にMarkdownリンクで出典を埋め込んでください。\n---\nテーマ: ${theme}\nターゲット: ${target}\n現在日付: ${today}`;
@@ -147,7 +192,7 @@ jobs:
       - name: Install AI SDK
         run: |
           npm init -y
-          npm i ai@5 @ai-sdk/anthropic@2
+          npm i ai@5 @ai-sdk/anthropic@2 @ai-sdk/google@2
 
       - name: Restore research
         env:
@@ -161,13 +206,15 @@ jobs:
           cat > write.mjs <<'EOF'
           import { generateText } from 'ai';
           import { anthropic } from '@ai-sdk/anthropic';
+          import { google } from '@ai-sdk/google';
           import fs from 'fs';
           const theme=process.env.THEME||''; const target=process.env.TARGET||''; const message=process.env.MESSAGE||''; const cta=process.env.CTA||'';
           const inputTags=(process.env.INPUT_TAGS||'').split(',').map(s=>s.trim()).filter(Boolean);
           const researchReport=fs.readFileSync('.note-artifacts/research.md','utf8');
           const modelName=process.env.CLAUDE_MODEL||'claude-sonnet-5-5';
+          const MODEL=(process.env.AI_ENGINE==='claude')?anthropic(modelName):google(process.env.GEMINI_MODEL||'gemini-flash-latest');
           function extractJsonFlexible(raw){const t=(raw||'').trim().replace(/\u200B/g,'');try{return JSON.parse(t);}catch{}const m=t.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/);if(m&&m[1]){try{return JSON.parse(m[1].trim());}catch{}}const f=t.indexOf('{'),l=t.lastIndexOf('}');if(f!==-1&&l!==-1&&l>f){const c=t.slice(f,l+1);try{return JSON.parse(c);}catch{}}return null;}
-          async function repairJson(raw){const sys='入力から {"title":string,"draftBody":string,"tags":string[]} のJSONのみ返答。';const {text}=await generateText({model:anthropic(modelName),system:sys,prompt:String(raw),temperature:0,maxOutputTokens:8000});return extractJsonFlexible(text||'');}
+          async function repairJson(raw){const sys='入力から {"title":string,"draftBody":string,"tags":string[]} のJSONのみ返答。';const {text}=await generateText({model:MODEL,system:sys,prompt:String(raw),temperature:0,maxOutputTokens:8000});return extractJsonFlexible(text||'');}
           function sanitizeTitle(t){
             let s=String(t||'').trim();
             // フェンスや見出し、引用符を除去
@@ -184,9 +231,19 @@ jobs:
             const firstReal=lines.find(l=>!/^```/.test(l))||lines[0]||'';
             return sanitizeTitle(firstReal);
           }
-          const sysWrite='note.com向け長文記事の生成。JSON {title,draftBody,tags[]} で返答。draftBodyは6000〜9000文字を目安に十分な分量で、章ごとに小見出しと箇条書きを適切に含めること。';
+          const sysWrite=[
+            'あなたは「これからAIを触ってみたい初心者」に向けて書く、やさしいnoteライターです。',
+            'JSON {title,draftBody,tags[]} だけで返答してください。draftBodyはMarkdown。',
+            '【長さ】draftBodyは2,500〜3,500文字。これを超えないこと。網羅より「まず1つ試せること」に絞る。',
+            '【冒頭】最初の3〜4行で、読者の悩みに共感し「この記事を読むと何ができるようになるか」を伝える。前置きや歴史の説明から始めない。',
+            '【読みやすさ】1段落は2〜3文まで。1文は短く。スマホで読んで息切れしない密度にする。',
+            '【言葉】専門用語はできるだけ使わない。使うときは直後に（）で一言説明するか、身近な例え話を添える。英語・略語の連発は禁止。',
+            '【構成】見出し(##)は4〜5個。箇条書きは1か所3〜5項目まで。表は使わない。最後に「まとめ」を3行で書き、読後のアクションを1つだけ促す。',
+            '【トーン】専門家ぶらず、隣で教える先輩のように親しみやすく。読者を不安にさせる表現や誇大表現は避ける。',
+            '【タイトル】32文字以内。初心者が「自分でもできそう」と思える具体的な言葉で。',
+          ].join('\n');
           const prompt=[`{テーマ}: ${theme}`,`{ペルソナ}: ${target}`,`{リサーチ内容}: ${researchReport}`,`{伝えたいこと}: ${message}`,`{読後のアクション}: ${cta}`].join('\n');
-          const {text}=await generateText({model:anthropic(modelName),system:sysWrite,prompt,temperature:0.7,maxOutputTokens:30000});
+          const {text}=await generateText({model:MODEL,system:sysWrite,prompt,temperature:0.7,maxOutputTokens:8000});
           let obj=extractJsonFlexible(text||'')||await repairJson(text||'');
           let title, draftBody, tags; if(obj){title=sanitizeTitle(obj.title); draftBody=String(obj.draftBody||'').trim(); tags=Array.isArray(obj.tags)?obj.tags.map(String):[]}
           if(!title||!draftBody){ title=deriveTitleFromText(text||''); const lines=(text||'').split(/\r?\n/); draftBody=lines.slice(1).join('\n').trim()||(text||''); tags=[]}
@@ -236,7 +293,7 @@ jobs:
       - name: Install AI SDK
         run: |
           npm init -y
-          npm i ai@5 @ai-sdk/anthropic@2
+          npm i ai@5 @ai-sdk/anthropic@2 @ai-sdk/google@2
 
       - name: Restore draft json
         env:
@@ -250,9 +307,11 @@ jobs:
           cat > factcheck.mjs <<'EOF'
           import { generateText } from 'ai';
           import { anthropic } from '@ai-sdk/anthropic';
+          import { google } from '@ai-sdk/google';
           import fs from 'fs';
           const draft=JSON.parse(fs.readFileSync('.note-artifacts/draft.json','utf8'));
           const modelName=process.env.CLAUDE_MODEL||'claude-sonnet-5-5';
+          const MODEL=(process.env.AI_ENGINE==='claude')?anthropic(modelName):google(process.env.GEMINI_MODEL||'gemini-flash-latest');
           const TAVILY_API_KEY=process.env.TAVILY_API_KEY||'';
           if(!TAVILY_API_KEY){ console.error('TAVILY_API_KEY is not set'); process.exit(1); }
 
@@ -274,16 +333,16 @@ jobs:
           }
 
           async function proposeQueries(body){
-            const sys='あなたは事実検証の専門家です。入力本文から検証が必要な固有名詞・数値・主張を抽出し、Tavily検索用に日本語の検索クエリを最大10件の配列で返してください。出力はJSON配列のみ。';
-            const { text } = await generateText({ model: anthropic(modelName), system: sys, prompt: String(body), temperature: 0, maxOutputTokens: 2000 });
+            const sys='あなたは事実検証の専門家です。入力本文から検証が必要な固有名詞・数値・主張を抽出し、Tavily検索用に日本語の検索クエリを最大5件の配列で返してください。出力はJSON配列のみ。';
+            const { text } = await generateText({ model: MODEL, system: sys, prompt: String(body), temperature: 0, maxOutputTokens: 2000 });
             const arr = extractJsonFlexible(text||'');
-            return Array.isArray(arr) ? arr.map(String).filter(Boolean).slice(0,10) : [];
+            return Array.isArray(arr) ? arr.map(String).filter(Boolean).slice(0,5) : [];
           }
 
           async function tavilySearch(q){
             const res = await fetch('https://api.tavily.com/search', {
               method: 'POST', headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ api_key: TAVILY_API_KEY, query: q, search_depth: 'advanced', max_results: 5, include_answer: true })
+              body: JSON.stringify({ api_key: TAVILY_API_KEY, query: q, search_depth: 'basic', max_results: 5, include_answer: true })
             });
             if(!res.ok){ return { query:q, results:[], answer:null }; }
             const json = await res.json().catch(()=>({}));
@@ -314,12 +373,12 @@ jobs:
             const sys=[
               'あなたは事実検証の専門家です。以下の原稿（note記事の下書き）に対し、提供されたエビデンス（Tavily検索結果）に基づき、',
               '誤情報の修正・低信頼出典の置換・信頼できる一次情報の本文内Markdownリンク埋め込みを行って、修正後の本文のみ返してください。',
-              '文体・構成は原稿を尊重し、必要に応じて本文末尾に参考文献セクションを追加してください。',
+              '文体・構成・文字数・読みやすさは原稿のまま保ち、文章を長くしないこと。必要に応じて本文末尾に参考文献（最大3件）を追加してください。',
             ].join('\n');
             const prompt = [
               '## 原稿', String(draft.draftBody||''), '', '## エビデンス（Tavily検索結果）', evidence
             ].join('\n\n');
-            const { text } = await generateText({ model: anthropic(modelName), system: sys, prompt, temperature: 0.3, maxOutputTokens: 30000 });
+            const { text } = await generateText({ model: MODEL, system: sys, prompt, temperature: 0.3, maxOutputTokens: 8000 });
             let body = stripCodeFence(text||'');
             let title = process.env.TITLE || draft.title || '';
             let tags = Array.isArray(draft.tags)? draft.tags: [];
